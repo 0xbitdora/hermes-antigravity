@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Add plugin parent dir to sys.path
@@ -50,6 +50,16 @@ _pkg_spec.loader.exec_module(_pkg)
 # below expire the generator's read loop deterministically instead of
 # relying on a short timeout plus the loop's sleep polling.
 _CLOCK_JUMP_SECONDS = 10 ** 6
+
+
+@contextlib.contextmanager
+def _mock_inherited_config(effort):
+    # Keep offline provider tests independent of Hermes runtime dependencies.
+    config = ModuleType("hermes_cli.config")
+    load_config = MagicMock(return_value={"agent": {"reasoning_effort": effort}})
+    setattr(config, "load_config_readonly", load_config)
+    with patch.dict(sys.modules, {"hermes_cli.config": config}):
+        yield load_config
 
 
 class AntigravityPluginTests(unittest.TestCase):
@@ -627,7 +637,7 @@ class AntigravityPluginTests(unittest.TestCase):
                     self.assertEqual(resolve_model_and_effort(model, effort), (model, effort))
             self.assertEqual(resolve_model_and_effort(model, "none"), (model, "low"))
             self.assertEqual(resolve_model_and_effort(model, "invalid"), (model, None))
-        with patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"reasoning_effort": "high"}}) as config:
+        with _mock_inherited_config("high") as config:
             for model in self._LIVE_IDS + self._FUTURE_IDS:
                 for effort in (None, "low", "max"):
                     self.assertEqual(resolve_model_and_effort(model, effort), (model, None))
@@ -692,11 +702,12 @@ class AntigravityPluginTests(unittest.TestCase):
                     if oneshot:
                         client._worker_lock.acquire()
                     try:
-                        with patch("client.subprocess.Popen", return_value=proc) as popen, patch("client.AntigravityStream"), patch.object(client, "_sync_workspace_rules", return_value=False), patch.object(client, "_terminate_process"), patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"reasoning_effort": "max"}}):
+                        with patch("client.subprocess.Popen", return_value=proc) as popen, patch("client.AntigravityStream"), patch.object(client, "_sync_workspace_rules", return_value=False), patch.object(client, "_terminate_process"), _mock_inherited_config("max") as config:
                             client.chat.completions.create(model=model, reasoning_effort="low", messages=[{"role": "user", "content": "fixture"}], stream=True)
                             expected = ["agy"] + ([] if oneshot else ["--input-format", "stream-json"]) + list(client._args) + ["--model", model]
                             self.assertEqual(popen.call_args.args[0], expected)
                             client.close()
+                            config.assert_not_called()
                     finally:
                         if client._worker_lock.locked():
                             client._worker_lock.release()
