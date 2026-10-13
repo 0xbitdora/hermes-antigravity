@@ -18,15 +18,52 @@ from providers.base import ProviderProfile
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_MODELS = (
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.1-pro",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6-thinking",
-    "gpt-oss-120b-medium",
-)
+try:
+    from .models import _CLI_EFFORTS, _FALLBACK_MODELS, _normalize_effort, supports_effort_flag
+except ImportError:  # flat source tree under test
+    from models import _CLI_EFFORTS, _FALLBACK_MODELS, _normalize_effort, supports_effort_flag
+
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*")
+_TABLE_HEADERS = {"id", "model", "model id", "model_id"}
+_DIAGNOSTIC_IDS = {"error", "warning", "failed", "failure"}
+
+
+def _parse_model_table(output: str) -> list[str] | None:
+    """Validate agy's ID/name table; preserve IDs, order and case exactly.
+
+    None means invalid/incomplete discovery; [] is a successful empty output.
+    Progress or headers alone cannot establish a successful empty table.
+    """
+    models: list[str] = []
+    seen: set[str] = set()
+    metadata = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().rstrip(".") == "fetching available models":
+            metadata = True
+            continue
+        fields = raw_line.split("\t")
+        model_id = fields[0]
+        if (
+            len(fields) == 2
+            and model_id.lower() in _TABLE_HEADERS
+            and fields[1].strip().lower() in {"name", "model name", "display name"}
+        ):
+            metadata = True
+            continue
+        if (
+            len(fields) != 2
+            or not fields[1].strip()
+            or not _MODEL_ID.fullmatch(model_id)
+            or model_id.lower().rstrip(":") in _DIAGNOSTIC_IDS | _TABLE_HEADERS
+        ):
+            return None
+        if model_id not in seen:
+            seen.add(model_id)
+            models.append(model_id)
+    return None if metadata and not models else models
 
 
 class AntigravityOAuthProfile(ProviderProfile):
@@ -49,21 +86,8 @@ class AntigravityOAuthProfile(ProviderProfile):
     def supported_reasoning_efforts(
         self, model: str | None
     ) -> tuple[str, ...] | None:
-        """Declared reasoning-effort vocabulary for models on this provider.
-        
-        Enables Hermes /model picker and /reasoning commands to offer appropriate
-        thinking effort options (low, medium, high) for reasoning-capable models.
-        """
-        m = (model or "").lower()
-        if "gemini-3.1-pro" in m:
-            return ("low", "high")
-        if "gemini" in m or "flash" in m or "pro" in m:
-            return ("low", "medium", "high")
-        if "claude" in m:
-            return ("low", "medium", "high")
-        if "gpt" in m:
-            return ()
-        return ("low", "medium", "high")
+        """Native variants own their effort; only suffixless Gemini accepts a flag."""
+        return _CLI_EFFORTS if supports_effort_flag(model) else ()
 
     def build_api_kwargs_extras(
         self,
@@ -72,17 +96,16 @@ class AntigravityOAuthProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Extract reasoning effort and forward as top-level api_kwargs to AntigravityClient."""
+        """Forward only supported separate effort flags for manual Gemini requests."""
+        if not supports_effort_flag(model):
+            return {}, {}
         effort = None
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
                 effort = "low"
             else:
-                effort = reasoning_config.get("effort")
-        top_level: dict[str, Any] = {}
-        if effort:
-            top_level["reasoning_effort"] = str(effort).strip().lower()
-        return {}, top_level
+                effort = _normalize_effort(reasoning_config.get("effort"))
+        return {}, {"reasoning_effort": effort} if effort else {}
 
     def fetch_models(
         self,
@@ -91,11 +114,10 @@ class AntigravityOAuthProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 15.0,
     ) -> list[str] | None:
-        """Query `agy models` and normalize to clean, deduplicated base models.
-        
-        Separates model families from thinking efforts (e.g. `gemini-3.8-flash-{low,medium,high}`
-        becomes `gemini-3.8-flash`), allowing Hermes' native reasoning effort picker to handle
-        the thinking depth cleanly.
+        """Return only exact IDs from a successful live `agy models` table.
+
+        None means failed discovery; [] means successful empty discovery.
+        No static catalog or plugin-owned cache is used.
         """
         try:
             from .client import resolve_agy_command
@@ -104,49 +126,29 @@ class AntigravityOAuthProfile(ProviderProfile):
             # the absolute name is the same module.
             from client import resolve_agy_command
 
-        cmd = resolve_agy_command()
         try:
+            cmd = resolve_agy_command()
             res = subprocess.run(
                 [cmd, "models"],
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 timeout=timeout,
             )
-            raw_models: list[str] = []
-            for raw_line in res.stdout.strip().splitlines():
-                line = raw_line.strip()
-                if not line or "fetching" in line.lower():
-                    continue
-                parts = line.split()
-                if parts:
-                    model_id = parts[0]
-                    if any(c in model_id.lower() for c in ("gemini", "claude", "gpt", "model")):
-                        raw_models.append(model_id)
-
-            if raw_models:
-                clean_models: list[str] = []
-                seen: set[str] = set()
-                for m in raw_models:
-                    base = m
-                    for suffix in ("-high", "-medium", "-low"):
-                        if m.endswith(suffix) and (m.startswith("gemini-") or "flash" in m or "pro" in m):
-                            base = m[:-len(suffix)]
-                            break
-                    if base not in seen:
-                        seen.add(base)
-                        clean_models.append(base)
-                return clean_models
+            if res.returncode != 0:
+                logger.debug("Antigravity model discovery exited %s", res.returncode)
+                return None
+            return _parse_model_table(res.stdout)
         except Exception as exc:
             logger.debug("Antigravity fetch_models failed: %s", exc)
 
-        return list(_FALLBACK_MODELS)
+        return None
 
     def get_model_context_length(self, model: str) -> int | None:
-        """Declared context window for Antigravity CLI.
-        
-        Defaults to 200,000 tokens (allowing conversations to comfortably pass
-        140k-160k tokens before auto-compression). Configurable via the
-        ANTIGRAVITY_CONTEXT_LENGTH environment variable.
+        """Defer to Hermes-native metadata unless a positive override is set.
+
+        This public hook declares no account-serving capacity of its own.
+        Unrecognized exact IDs may receive Hermes' generic unknown fallback.
         """
         env_val = os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
@@ -156,7 +158,7 @@ class AntigravityOAuthProfile(ProviderProfile):
                     return val
             except ValueError:
                 pass
-        return 200_000
+        return None
 
     def classify_api_error(
         self,
@@ -229,7 +231,7 @@ antigravity_profile = AntigravityOAuthProfile(
     process_args=("--output-format", "stream-json", "--disable-slash-commands"),
     process_command_env_vars=("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"),
     process_args_env_var="ANTIGRAVITY_ARGS",
-    default_aux_model="gemini-3.8-flash",
+    default_aux_model="",
     fallback_models=_FALLBACK_MODELS,
     supports_vision=True,
     classify_api_error=_classify_antigravity_error,
