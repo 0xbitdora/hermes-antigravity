@@ -537,10 +537,10 @@ class AntigravityStream(Iterator[Any]):
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
                 if not line:
-                    if self.proc.poll() is not None:
-                        break
-                    time.sleep(0.01)
-                    continue
+                    # Optimization: `readline()` on a blocking pipe automatically blocks until
+                    # a full line is received or EOF is reached. An empty string exclusively
+                    # indicates EOF, so there's no need to poll `proc.poll()` or use `time.sleep()`.
+                    break
 
                 line = line.strip()
                 if not line.startswith("{"):
