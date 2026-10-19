@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import queue
 import subprocess
 import threading
 import time
@@ -196,6 +197,7 @@ class AntigravityStream(Iterator[Any]):
         worker_lock_held: bool | None = None,
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
+        thinking_reader: Any = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -212,6 +214,10 @@ class AntigravityStream(Iterator[Any]):
                 "that acquired it must carry the ownership flag so its "
                 "cleanup can release it."
             )
+        self._thinking_reader = thinking_reader
+        self._reader_stop = threading.Event()
+        self._reader_thread = None
+        self._thinking_next_poll = 0.0
         self.proc = proc
         self.client = client
         self.model = model
@@ -234,7 +240,8 @@ class AntigravityStream(Iterator[Any]):
         # Cumulative usage snapshot of the worker session that owns this
         # stream; only worker streams receive one (see client._create_chat_completion).
         self.usage_baseline = usage_baseline
-        self.conversation_id = ""
+        prior_id = getattr(client, "_worker_conversation_id", "") if is_worker else ""
+        self.conversation_id = prior_id if isinstance(prior_id, str) else ""
         self._closed = False
         self._interrupted = False
         self._finished = False
@@ -372,21 +379,10 @@ class AntigravityStream(Iterator[Any]):
         not per-request, non-blocking is the best a plugin can do without a
         Hermes hook that would hand out a coroutine from create().
 
-        Cancelling an in-flight ``__anext__`` (e.g. a ``wait_for`` timeout)
-        leaves the stream unclosed: the worker lock stays held, the worker
-        process stays alive, and the private executor's worker stays blocked
-        in ``readline()`` until something calls ``close()``. Hermes' own
-        ``_aggregate_chat_stream_async`` supplies that ``close()`` on
-        realistic paths -- its ``finally`` runs ``_close_chunk_stream(chunks,
-        allow_aclose=True)``, which finds this class's sync ``close()`` --
-        matching the sync behavior of abandoning a stream without calling
-        ``close()``. No ``CancelledError`` handler is added here on purpose:
-        reacting to cancellation would change the close/terminate semantics,
-        which is out of scope for this fix. A stream neither consumed nor
-        closed keeps its executor thread (non-daemon, like every
-        ThreadPoolExecutor thread) blocked until the process exits; the same
-        is true of an abandoned sync stream's subprocess, and closing the
-        client terminates the child, unblocking the read.
+        Cancelling an in-flight ``__anext__`` closes the stream, terminates
+        its worker, and releases its request lock. The DB timer stops and the
+        stdout reader unblocks when the child exits. Explicit close() remains
+        required for a sync stream abandoned before completion.
         """
         if self._closed:
             raise StopAsyncIteration
@@ -395,9 +391,13 @@ class AntigravityStream(Iterator[Any]):
             executor = self._async_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="agy-stream"
             )
-        stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
-            executor, self._pull_chunk
-        )
+        try:
+            stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
+                executor, self._pull_chunk
+            )
+        except asyncio.CancelledError:
+            self.close()
+            raise
         if stream_exhausted:
             raise StopAsyncIteration
         return chunk
@@ -421,6 +421,7 @@ class AntigravityStream(Iterator[Any]):
         if self._closed:
             return
         self._closed = True
+        self._stop_optional_readers()
         if self.is_worker:
             # Terminate the worker only if it is still OURS. The interrupted
             # path runs at an arbitrary later time on an arbitrary thread --
@@ -442,6 +443,63 @@ class AntigravityStream(Iterator[Any]):
         # _retire_executor); a second call is a harmless no-op because an
         # already-shut-down executor accepts shutdown() again.
         self._retire_executor()
+        self._join_stdout_reader()
+
+    def _stop_optional_readers(self) -> None:
+        self._reader_stop.set()
+        if self._thinking_reader is not None:
+            self._thinking_reader.close()
+
+    def _join_stdout_reader(self) -> None:
+        thread = self._reader_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.3)
+
+    def _read_line(self, deadline: float) -> str | None:
+        """Multiplex stdout with the DB timer, without extra DB watcher threads.
+
+        A turn-scoped reader stops AT result (before another blocking read),
+        leaving persistent-worker stdout available to the next turn. Cancel/
+        timeout terminates the child via close(), unblocking the single reader.
+        StringIO and other scripted test streams use the identical queue path.
+        """
+        if self._reader_thread is None:
+            self._stdout_queue = queue.Queue(maxsize=64)
+
+            def read_stdout():
+                try:
+                    while not self._reader_stop.is_set():
+                        line = self.proc.stdout.readline() if self.proc.stdout else ""
+                        while not self._reader_stop.is_set():
+                            try:
+                                self._stdout_queue.put(line, timeout=0.05)
+                                break
+                            except queue.Full:
+                                continue
+                        if not line:
+                            return
+                        try:
+                            if json.loads(line).get("event") == "result":
+                                return
+                        except (ValueError, AttributeError):
+                            continue
+                except Exception as exc:
+                    while not self._reader_stop.is_set():
+                        try:
+                            self._stdout_queue.put(exc, timeout=0.05)
+                            return
+                        except queue.Full:
+                            continue
+
+            self._reader_thread = threading.Thread(target=read_stdout, name="agy-stream-stdout-turn", daemon=True)
+            self._reader_thread.start()
+        try:
+            item = self._stdout_queue.get(timeout=max(0.001, min(0.1, deadline - time.monotonic())))
+        except queue.Empty:
+            return None
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def _make_chunk(
         self,
@@ -449,13 +507,14 @@ class AntigravityStream(Iterator[Any]):
         content: str | None = None,
         tool_calls: list[Any] | None = None,
         finish_reason: str | None = None,
+        reasoning_content: str | None = None,
     ) -> Any:
         delta = SimpleNamespace(
             role="assistant",
             content=content,
             tool_calls=tool_calls,
             reasoning=None,
-            reasoning_content=None,
+            reasoning_content=reasoning_content,
         )
         choice = SimpleNamespace(
             index=0,
@@ -582,14 +641,24 @@ class AntigravityStream(Iterator[Any]):
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
-                line = self.proc.stdout.readline() if self.proc.stdout else ""
+                line = self._read_line(deadline)
+                if self._closed:
+                    break
+                if self._thinking_reader is not None and time.monotonic() >= self._thinking_next_poll:
+                    self._thinking_next_poll = time.monotonic() + 0.1
+                    for thinking_delta in self._thinking_reader.poll(self.conversation_id):
+                        yield self._make_chunk(reasoning_content=thinking_delta)
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
+                if line is None:
+                    # Idle poll slice: no stdout yet, loop to service the
+                    # thinking reader and early-error checks.
+                    continue
                 if not line:
-                    # Optimization: `readline()` on a blocking pipe automatically blocks until
-                    # a full line is received or EOF is reached. An empty string exclusively
-                    # indicates EOF, so there's no need to poll `proc.poll()` or use `time.sleep()`.
+                    # `_read_line` returns an empty string exclusively on EOF of the
+                    # reader thread's blocking `readline()`; no `proc.poll()` or
+                    # `time.sleep()` needed.
                     break
 
                 line = line.strip()
@@ -642,6 +711,17 @@ class AntigravityStream(Iterator[Any]):
                         break
                     if "usage" in step:
                         usage_data = step["usage"]
+
+                    # Display-only metadata: never merge thinking into answer/tool text.
+                    # The stream's own thinking_delta is authoritative; the DB
+                    # sidechannel exists only for models/agy versions that do not
+                    # emit it. Once the stream carries thinking, stop the DB poll so
+                    # the same reasoning is not delivered twice.
+                    thinking_delta = step.get("thinking_delta")
+                    if isinstance(thinking_delta, str) and thinking_delta:
+                        if self._thinking_reader is not None and not self._thinking_reader.closed:
+                            self._thinking_reader.close()
+                        yield self._make_chunk(reasoning_content=thinking_delta)
 
                     text_delta = step.get("text_delta")
                     if text_delta:
@@ -742,6 +822,8 @@ class AntigravityStream(Iterator[Any]):
                     )
                     break
 
+            self._stop_optional_readers()
+            self._join_stdout_reader()
             if text_buffer and not has_tool_calls:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
@@ -963,6 +1045,14 @@ class AntigravityStream(Iterator[Any]):
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+            # Keep agy's output/total counters unchanged: thinking is a separate
+            # reported breakdown, not an inferred surcharge on the total.
+            thinking_tokens = None
+            if "thinking_tokens" in usage_data:
+                if self.is_worker and self.usage_baseline is not None:
+                    thinking_tokens = _counter_delta(usage_data, self.usage_baseline, "thinking_tokens")
+                elif usage_data["thinking_tokens"] is not None:
+                    thinking_tokens = int(usage_data["thinking_tokens"])
 
             yield self._make_chunk(finish_reason=finish_reason)
 
@@ -970,6 +1060,10 @@ class AntigravityStream(Iterator[Any]):
                 prompt_tokens=input_tokens,
                 completion_tokens=output_tokens,
                 total_tokens=total_tokens,
+                completion_tokens_details=(
+                    SimpleNamespace(reasoning_tokens=thinking_tokens)
+                    if thinking_tokens is not None else None
+                ),
                 prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
             )
             yield SimpleNamespace(
@@ -999,6 +1093,7 @@ class AntigravityStream(Iterator[Any]):
             success = False
             raise
         finally:
+            self._stop_optional_readers()
             watchdog_stop.set()
             if watchdog_thread and watchdog_thread.is_alive():
                 watchdog_thread.join(timeout=0.2)
@@ -1010,6 +1105,8 @@ class AntigravityStream(Iterator[Any]):
                     # full history Hermes sends.
                     self.client._terminate_worker()
                 if success and not self._interrupted:
+                    if self.proc is self.client._worker_proc:
+                        self.client._worker_conversation_id = self.conversation_id
                     self.client._update_worker_history(self.messages)
                     self._release_worker_lock_once()
                 else:
@@ -1018,7 +1115,7 @@ class AntigravityStream(Iterator[Any]):
                 self.close()
 
 
-def collect_stream_completion(stream: AntigravityStream) -> Any:
+def collect_stream_completion(stream: AntigravityStream, *, reasoning_emitter=None) -> Any:
     """Consume an AntigravityStream completely and assemble a non-streaming ChatCompletion object.
 
     The returned object is a :class:`_AwaitableCompletion`: identical in shape
@@ -1029,6 +1126,7 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
     conversation_id = ""
     model = stream.model
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[Any] = []
     finish_reason: str | None = None
     usage: Any = None
@@ -1046,6 +1144,13 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
                 finish_reason = choice.finish_reason
             delta = getattr(choice, "delta", None)
             if delta:
+                if getattr(delta, "reasoning_content", None):
+                    reasoning_parts.append(delta.reasoning_content)
+                    if reasoning_emitter is not None:
+                        try:
+                            reasoning_emitter(delta.reasoning_content)
+                        except Exception:
+                            reasoning_emitter = None  # optional UI cannot break collection
                 if getattr(delta, "content", None):
                     content_parts.append(delta.content)
                 if getattr(delta, "tool_calls", None):
@@ -1076,7 +1181,7 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
         content=full_content,
         tool_calls=tool_calls if tool_calls else None,
         reasoning=None,
-        reasoning_content=None,
+        reasoning_content="".join(reasoning_parts) or None,
         reasoning_details=None,
     )
     choice = SimpleNamespace(

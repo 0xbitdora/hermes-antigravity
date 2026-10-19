@@ -100,16 +100,28 @@ class AntigravityOAuthProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Forward only supported separate effort flags for manual Gemini requests."""
+        """Project the session for live reasoning; forward effort only when agy accepts it.
+
+        The separate CLI effort flag is valid only for manual suffixless Gemini
+        requests. The session projection is independent of the model.
+        """
+        top_level: dict[str, Any] = {}
+        session_id = context.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            from .live_reasoning import ensure_registered
+            ensure_registered()
+            top_level["_agy_session_id"] = session_id
         if not supports_effort_flag(model):
-            return {}, {}
+            return {}, top_level
         effort = None
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
                 effort = "low"
             else:
                 effort = _normalize_effort(reasoning_config.get("effort"))
-        return {}, {"reasoning_effort": effort} if effort else {}
+        if effort:
+            top_level["reasoning_effort"] = effort
+        return {}, top_level
 
     def fetch_models(
         self,
@@ -273,3 +285,9 @@ antigravity_profile = AntigravityOAuthProfile(
 )
 
 register_provider(antigravity_profile)
+
+
+def register(ctx):
+    """Optional general-plugin lifecycle entry point (provider discovery skips it)."""
+    from .live_reasoning import register as register_reasoning
+    return register_reasoning(ctx)

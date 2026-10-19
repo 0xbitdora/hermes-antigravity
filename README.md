@@ -108,6 +108,42 @@ That fallback is **unknown metadata, not native model capacity**. If necessary,
 set an explicit conservative budget for your route. This change does not establish
 million-token account acceptance; serving limits require separate live testing.
 
+## Live reasoning on non-streaming Hermes turns
+
+`external_process` authentication remains unchanged: Hermes selects its normal
+non-streaming path. For foreground agents with an installed reasoning callback
+and a text-stream consumer, the plugin's collector forwards available reasoning
+while it assembles the response. It calls the existing callback, preserving the
+TUI's show/hide and notification-mute gates. Reasoning remains separate from
+answer/tool content and is never added to the replay prompt.
+
+The profile's main-request projection installs `llm_execution` middleware using
+`PluginContext.register_middleware`. This explicit bootstrap is necessary because
+Hermes' provider discovery imports model-provider plugins but skips their general
+`register(ctx)` lifecycle. Registration is profile-local, idempotent, and uses an
+unloadable host registration handle. Auxiliary projections carry no session ID.
+
+A context-local, single-collector lease fences delivery by profile, provider,
+model, session, turn, request, current callback identity and client liveness.
+Cancellation, closing sessions, request replacement and middleware exit disable
+late delivery. Missing host compatibility seams disable only the optional live
+presentation; completed reasoning and usage remain available. Streaming callers
+continue to receive ordinary chunks, with no extra callback delivery.
+
+This uses read-only host internals for current-agent/session lookup; compatibility
+is tested against the installed Hermes checkout, not guaranteed for all releases.
+Already running processes retain their previously loaded plugin code; this plugin
+does not hot-patch them. No daemon restart or configuration change is performed.
+Agy may return no thinking text even when a request otherwise succeeds. Live
+history restoration and actual frontend rendering are separate from delivery.
+
+The opt-in `scripts/verify_live_reasoning.py` makes one bounded, tool-free call to
+bare `gemini-4-argon` using the existing account. It exercises real AIAgent kwargs,
+the unchanged `_should_stream=False` decision, middleware, the nonstream worker,
+agy/DB reader, collector, and installed TUI reasoning callback. Only UI egress is
+captured; it does not prove display in an existing desktop window. Its receipt
+records counts/times, never reasoning text. See `VERIFICATION.md`.
+
 ## Development
 
 ```bash
