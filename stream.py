@@ -24,6 +24,54 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# agy reports a reply cut off at the model's output cap as a result "error".
+# That is an output truncation, not a failed request: surfacing it as a
+# RuntimeError made Hermes read "token limit" as a context overflow and print
+# the wrong recovery advice. It is mapped to finish_reason="length" so Hermes'
+# truncation recovery handles it.
+#
+# Detection order: a structured finish/stop reason on the result event when
+# agy provides one, then the exact response-truncation sentences embedded in
+# the agy binary. The sentences are matched whole, not by the loose phrase
+# "output token limit": agy uses that phrase in unrelated auxiliary messages
+# too ("Checkpoint summary exceeded the max output token limit of %d",
+# "intent prediction exceeded the max output token limit of %d").
+_OUTPUT_LIMIT_REASON_KEYS = ("finish_reason", "finishReason", "stop_reason", "stopReason")
+_OUTPUT_LIMIT_REASONS = frozenset({"max_tokens", "max_output_tokens", "length"})
+_OUTPUT_LIMIT_MARKERS = (
+    "your previous response was cut off because it exceeded the output token limit",
+    "your response exceeded the maximum output token limit and was truncated",
+)
+
+
+def _is_output_limit_error(error_msg: Any) -> bool:
+    """True when ``error_msg`` is agy's response-truncation error text."""
+    if not isinstance(error_msg, str):
+        return False
+    lowered = " ".join(error_msg.lower().split())
+    return any(marker in lowered for marker in _OUTPUT_LIMIT_MARKERS)
+
+
+def _result_reports_output_limit(result: Any) -> bool:
+    """True when the agy result event carries a structured max-tokens reason.
+
+    Checked on the result itself and on its ``metadata`` mapping, under the
+    common Gemini/OpenAI/Anthropic key spellings. Absent keys are not a signal
+    either way; the error text check remains the fallback.
+    """
+    if not isinstance(result, dict):
+        return False
+    sources = [result]
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+    for source in sources:
+        for key in _OUTPUT_LIMIT_REASON_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip().lower() in _OUTPUT_LIMIT_REASONS:
+                return True
+    return False
+
 
 class _UsageDeltas(NamedTuple):
     """Per-turn usage derived from cumulative worker-session counters."""
@@ -499,6 +547,8 @@ class AntigravityStream(Iterator[Any]):
         saw_result = False
         neutralized_tool_step = False
         success = False
+        # agy cut the reply at the output cap (see _is_output_limit_error).
+        output_truncated = False
         start_time = time.monotonic()
 
         gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
@@ -651,6 +701,10 @@ class AntigravityStream(Iterator[Any]):
                         usage_data = res["usage"]
                     if "error" in res:
                         error_msg = res["error"]
+                    if _result_reports_output_limit(res) or _is_output_limit_error(error_msg):
+                        logger.warning("Antigravity reply hit the output token limit: %s", error_msg or res.get("status", ""))
+                        output_truncated = True
+                        error_msg = ""
                     saw_result = True
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
@@ -683,6 +737,7 @@ class AntigravityStream(Iterator[Any]):
                     success = (
                         status == "SUCCESS"
                         and not error_msg
+                        and not output_truncated
                         and bool(has_content or has_tool_calls or text_buffer or final_resp)
                     )
                     break
@@ -756,7 +811,7 @@ class AntigravityStream(Iterator[Any]):
                 # SUCCESS result is unverified -- and mirrored in the success
                 # verdict above, so this failed turn can never reach the
                 # worker-history update.
-                if error_msg or status == "ERROR":
+                if not output_truncated and (error_msg or status == "ERROR"):
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 # `not in (None, 0)`, not `!= 0`: with the raw poll() above,
@@ -789,7 +844,7 @@ class AntigravityStream(Iterator[Any]):
                 # cannot be retracted -- Hermes aggregates a stream that
                 # raises mid-way, so failing the turn is the only honest
                 # outcome.
-                if not neutralized_tool_step and not success:
+                if not neutralized_tool_step and not success and not output_truncated:
                     raise RuntimeError(
                         "Antigravity execution failed: "
                         + self._empty_result_message(
@@ -817,7 +872,7 @@ class AntigravityStream(Iterator[Any]):
                 # so this failed turn can never reach the worker-history
                 # update; the deltas already yielded cannot be retracted --
                 # Hermes aggregates a stream that raises mid-way.
-                if error_msg or status == "ERROR":
+                if not output_truncated and (error_msg or status == "ERROR"):
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 worker_exit = self.proc.poll()
@@ -882,7 +937,7 @@ class AntigravityStream(Iterator[Any]):
                 # cannot be retracted -- Hermes aggregates a stream that
                 # raises mid-way -- so the turn fails, and the finally's
                 # close() terminates the worker that broke it.
-                if not neutralized_tool_step and not success:
+                if not neutralized_tool_step and not success and not output_truncated:
                     raise RuntimeError(
                         "Antigravity execution failed: "
                         + self._empty_result_message(
@@ -893,7 +948,10 @@ class AntigravityStream(Iterator[Any]):
                         )
                     )
 
-            finish_reason = "tool_calls" if has_tool_calls else "stop"
+            if output_truncated:
+                finish_reason = "length"
+            else:
+                finish_reason = "tool_calls" if has_tool_calls else "stop"
 
             # Resolve usage (advancing the cumulative worker baseline) BEFORE
             # emitting the finish-reason chunk. The common client pattern
@@ -945,6 +1003,12 @@ class AntigravityStream(Iterator[Any]):
             if watchdog_thread and watchdog_thread.is_alive():
                 watchdog_thread.join(timeout=0.2)
             if self.is_worker:
+                if output_truncated and not success and self.proc is self.client._worker_proc:
+                    # The truncated reply is not a usable exchange to resume
+                    # from, and close() leaves a _finished worker alive:
+                    # retire it explicitly so the next turn respawns with the
+                    # full history Hermes sends.
+                    self.client._terminate_worker()
                 if success and not self._interrupted:
                     self.client._update_worker_history(self.messages)
                     self._release_worker_lock_once()
