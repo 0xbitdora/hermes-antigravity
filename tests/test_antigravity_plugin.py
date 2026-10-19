@@ -17,7 +17,12 @@ plugin_dir = Path(__file__).resolve().parent.parent
 if str(plugin_dir) not in sys.path:
     sys.path.insert(0, str(plugin_dir))
 
-from providers import get_provider_profile
+try:
+    from providers import get_provider_profile
+except ImportError:
+    # Skip tests if Hermes Agent checkout is not in PYTHONPATH
+    raise unittest.SkipTest("Skipping test_antigravity_plugin.py: 'providers' module from Hermes Agent not found in PYTHONPATH.")
+
 from client import (
     AntigravityClient,
     AntigravityStream,
