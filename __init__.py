@@ -239,22 +239,39 @@ def _classify_antigravity_error(
     recovery pipeline triggers auto-compression and retry instead of failing.
     """
     err_str = f"{error} {message}".lower()
+    # Genuine context limits trigger compression
     if any(
         pattern in err_str
         for pattern in (
-            "subscriber fell behind updates",
-            "stalled for 5s",
-            "empty result (status='success')",
-            "empty result (status=\"success\")",
-            "context canceled",
             "max_trajectory_tokens",
             "max trajectory tokens",
+            "prompt exceeds token limit",
+            "exceeds the maximum context length",
+            "context length exceeded",
         )
     ):
         return {
             "reason": "context_overflow",
             "retryable": True,
             "should_compress": True,
+        }
+    # Transient stream/empty/pipe errors are retryable without compressing
+    if any(
+        pattern in err_str
+        for pattern in (
+            "subscriber fell behind updates",
+            "stalled for 5s",
+            "empty result",
+            "context canceled",
+            "broken pipe",
+            "connection reset",
+            "process exited with return code",
+        )
+    ):
+        return {
+            "reason": "other",
+            "retryable": True,
+            "should_compress": False,
         }
     return None
 

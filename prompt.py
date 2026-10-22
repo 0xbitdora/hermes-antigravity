@@ -40,18 +40,52 @@ def _render_message_content(content: Any) -> str:
     if isinstance(content, dict):
         if "text" in content:
             return str(content.get("text") or "").strip()
-        return str(content.get("content") or "").strip()
+        if "content" in content:
+            return str(content.get("content") or "").strip()
+        # Handle dict-like media types
+        item_type = str(content.get("type") or "").lower()
+        if item_type == "image_url":
+            url_info = content.get("image_url")
+            url_str = url_info.get("url", "") if isinstance(url_info, dict) else str(url_info or "")
+            return f"[User attached an image: {url_str}]"
+        if item_type in ("input_audio", "audio"):
+            return "[User sent a voice message/audio]"
+        return str(content).strip()
     if isinstance(content, list):
         parts = []
         for item in content:
             if isinstance(item, str):
                 parts.append(item.strip())
             elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text") or "").strip())
-                elif "content" in item:
-                    parts.append(str(item.get("content") or "").strip())
-        return "\n".join(p for p in parts if p).strip()
+                item_type = str(item.get("type") or "").lower()
+                if item_type == "text":
+                    if t := str(item.get("text") or "").strip():
+                        parts.append(t)
+                elif "content" in item and item.get("content"):
+                    parts.append(str(item.get("content")).strip())
+                elif item_type == "image_url":
+                    url_info = item.get("image_url")
+                    url_str = url_info.get("url", "") if isinstance(url_info, dict) else str(url_info or "")
+                    parts.append(f"[User attached an image: {url_str}]")
+                elif item_type in ("input_audio", "audio"):
+                    transcript = item.get("transcript") or item.get("text")
+                    if transcript:
+                        parts.append(f"[Voice transcript: {transcript}]")
+                    else:
+                        parts.append("[User sent a voice message]")
+                elif item_type in ("file", "document"):
+                    name = item.get("name") or item.get("filename") or item.get("path") or "file"
+                    parts.append(f"[User attached a file: {name}]")
+                else:
+                    # Generic fallback for any other structured item
+                    val = item.get("text") or item.get("value")
+                    if val:
+                        parts.append(str(val).strip())
+        res = "\n".join(p for p in parts if p).strip()
+        if not res and content:
+            # Fallback if list had items but none were plain text
+            return "[User sent media attachments]"
+        return res
     return str(content).strip()
 
 
@@ -427,7 +461,10 @@ def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence
             return False
         if inc_msg.get("role") != h_msg.get("role"):
             return False
-        if inc_msg.get("content") != h_msg.get("content"):
+        # Normalize content to string for comparison so multimodal / structured differences don't miscompare
+        h_content = _render_message_content(h_msg.get("content"))
+        inc_content = _render_message_content(inc_msg.get("content"))
+        if h_content != inc_content:
             return False
         if inc_msg.get("tool_calls") != h_msg.get("tool_calls"):
             return False
@@ -512,28 +549,30 @@ def _parse_tool_block(block: str) -> tuple[list[Any], str]:
         from agent.acp_openai_bridge import extract_tool_calls_from_text
         calls, cleaned_text = extract_tool_calls_from_text(block)
     except Exception:
-        m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", block, re.DOTALL)
-        if m:
-            try:
-                obj = json.loads(m.group(1))
-                fn = obj.get("function", {})
-                call_id = obj.get("id") or "call_1"
-                fn_name = fn.get("name", "")
-                fn_args = fn.get("arguments", "{}")
-                if not isinstance(fn_args, str):
-                    fn_args = json.dumps(fn_args, ensure_ascii=False)
-                calls = [
-                    SimpleNamespace(
-                        id=call_id,
-                        type="function",
-                        function=SimpleNamespace(name=fn_name, arguments=fn_args),
+        calls = []
+        cleaned_text = block
+        matches = list(re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", block, re.DOTALL))
+        if matches:
+            for i, m in enumerate(matches):
+                try:
+                    obj = json.loads(m.group(1))
+                    fn = obj.get("function", {})
+                    call_id = obj.get("id") or f"call_{i+1}"
+                    fn_name = fn.get("name", "")
+                    fn_args = fn.get("arguments", "{}")
+                    if not isinstance(fn_args, str):
+                        fn_args = json.dumps(fn_args, ensure_ascii=False)
+                    calls.append(
+                        SimpleNamespace(
+                            id=call_id,
+                            type="function",
+                            function=SimpleNamespace(name=fn_name, arguments=fn_args),
+                        )
                     )
-                ]
-                cleaned_text = block[:m.start()] + block[m.end():]
-            except Exception:
-                cleaned_text = block
-        else:
-            cleaned_text = block
+                except Exception:
+                    pass
+            # Remove all tool call blocks from cleaned_text
+            cleaned_text = re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", block, flags=re.DOTALL)
 
     deltas = []
     for i, call in enumerate(calls):

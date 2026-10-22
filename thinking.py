@@ -84,7 +84,7 @@ def decode_thinking(payload: bytes) -> str:
 
 
 def _connect(path):
-    return contextlib.closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.05))
+    return contextlib.closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5))
 
 
 class ThinkingReader:
